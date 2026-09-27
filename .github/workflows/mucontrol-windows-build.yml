@@ -1,0 +1,112 @@
+name: MU Control Windows Build
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mucontrol-windows-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Generate ephemeral RSA key
+        shell: pwsh
+        run: |
+          $openssl = "C:\Program Files\Git\usr\bin\openssl.exe"
+          if (!(Test-Path $openssl)) { throw "OpenSSL not found: $openssl" }
+          & $openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out private.pem
+          if ($LASTEXITCODE -ne 0) { throw "RSA private key generation failed" }
+          & $openssl pkey -in private.pem -pubout -out public.pem
+          if ($LASTEXITCODE -ne 0) { throw "RSA public key export failed" }
+
+      - name: Publish public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: mucontrol-public-key-${{ github.run_id }}
+          path: public.pem
+          retention-days: 1
+
+      - name: Wait for encrypted build request
+        shell: pwsh
+        run: |
+          $run = "${{ github.run_id }}"
+          $base = "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/build-request"
+          $request = "$base/request-$run.txt"
+          Write-Host "Waiting for encrypted request for run $run"
+          $found = $false
+          for ($i=0; $i -lt 180; $i++) {
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing -Uri ($request + "?t=" + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -TimeoutSec 10
+              if ($r.StatusCode -eq 200 -and $r.Content.Trim() -eq "READY") { $found = $true; break }
+            } catch {}
+            Start-Sleep -Seconds 5
+          }
+          if (-not $found) { throw "Encrypted build request timed out" }
+          Invoke-WebRequest -UseBasicParsing -Uri "$base/payload-$run.enc" -OutFile payload.enc
+          Invoke-WebRequest -UseBasicParsing -Uri "$base/key-$run.enc" -OutFile key.enc
+
+      - name: Decrypt source payload
+        shell: pwsh
+        run: |
+          $openssl = "C:\Program Files\Git\usr\bin\openssl.exe"
+          & $openssl pkeyutl -decrypt -inkey private.pem -in key.enc -out keyiv.bin -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if ($LASTEXITCODE -ne 0) { throw "RSA unwrap failed" }
+          $b = [System.IO.File]::ReadAllBytes("keyiv.bin")
+          if ($b.Length -ne 48) { throw "Invalid key material length: $($b.Length)" }
+          $key = -join ($b[0..31] | ForEach-Object { $_.ToString("x2") })
+          $iv  = -join ($b[32..47] | ForEach-Object { $_.ToString("x2") })
+          & $openssl enc -d -aes-256-cbc -K $key -iv $iv -in payload.enc -out payload.zip
+          if ($LASTEXITCODE -ne 0) { throw "AES decrypt failed" }
+          Expand-Archive -LiteralPath payload.zip -DestinationPath src -Force
+          if (!(Test-Path src\MUControlUnified.cs)) { throw "Source missing after decrypt" }
+
+      - name: Compile MUControl.exe on .NET Framework
+        shell: pwsh
+        run: |
+          $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (!(Test-Path $csc)) { $csc = "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe" }
+          if (!(Test-Path $csc)) { throw ".NET Framework csc.exe not found" }
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+          $args = @(
+            "/nologo",
+            "/target:winexe",
+            "/platform:anycpu",
+            "/optimize+",
+            "/main:MUControlOneExe.OneProgram",
+            "/out:out\MUControl.exe",
+            "/win32manifest:src\MUControl.manifest",
+            "/resource:src\boundary.sql,MUControl.Boundary.sql",
+            "/reference:System.dll",
+            "/reference:System.Core.dll",
+            "/reference:System.Data.dll",
+            "/reference:System.Drawing.dll",
+            "/reference:System.Windows.Forms.dll",
+            "/reference:System.ServiceProcess.dll",
+            "/reference:System.Web.Extensions.dll",
+            "/reference:System.Security.dll",
+            "src\MUControlUnified.cs"
+          )
+          & $csc @args 2>&1 | Tee-Object -FilePath compile.log
+          if ($LASTEXITCODE -ne 0) { throw "Compile failed with exit code $LASTEXITCODE" }
+          if (!(Test-Path out\MUControl.exe)) { throw "MUControl.exe not produced" }
+          $hash = (Get-FileHash out\MUControl.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item out\MUControl.exe).Length
+          "SHA256=$hash" | Set-Content out\BUILD_INFO.txt -Encoding ascii
+          "SIZE=$size" | Add-Content out\BUILD_INFO.txt -Encoding ascii
+          "RUN_ID=${{ github.run_id }}" | Add-Content out\BUILD_INFO.txt -Encoding ascii
+          "BUILD_UTC=$([DateTime]::UtcNow.ToString('o'))" | Add-Content out\BUILD_INFO.txt -Encoding ascii
+          Get-Content out\BUILD_INFO.txt
+
+      - name: Upload compiled binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: MUControl-compiled-${{ github.run_id }}
+          path: |
+            out/MUControl.exe
+            out/BUILD_INFO.txt
+            compile.log
+          retention-days: 1
